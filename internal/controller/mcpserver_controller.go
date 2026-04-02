@@ -35,7 +35,7 @@ type MCPServerReconciler struct {
 func (r *MCPServerReconciler) mcpBridgeImage() string {
 	registry := os.Getenv("SYMPOZIUM_IMAGE_REGISTRY")
 	if registry == "" {
-		registry = imageRegistry // fallback to the package-level default
+		registry = defaultImageRegistry
 	}
 	tag := os.Getenv("SYMPOZIUM_IMAGE_TAG")
 	if tag == "" {

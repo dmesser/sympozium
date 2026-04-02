@@ -32,6 +32,10 @@ spec:
             - --leader-elect
             {{- end }}
           env:
+            - name: SYMPOZIUM_IMAGE_REGISTRY
+              value: {{ .Values.image.registry | quote }}
+            - name: SYMPOZIUM_IMAGE_TAG
+              value: {{ include "sympozium.imageTag" . | quote }}
             - name: NATS_URL
               value: {{ include "sympozium.natsUrl" . }}
             - name: POD_NAME

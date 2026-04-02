@@ -48,15 +48,27 @@ type agentResult struct {
 	} `json:"metrics"`
 }
 
+type actionSuggestion struct {
+	Label  string `json:"label"`
+	Prompt string `json:"prompt"`
+}
+
 type streamChunk struct {
-	Type    string `json:"type"`
-	Content string `json:"content"`
-	Index   int    `json:"index"`
+	Type        string             `json:"type"`
+	Content     string             `json:"content,omitempty"`
+	Index       int                `json:"index"`
+	ToolID      string             `json:"toolId,omitempty"`
+	ToolName    string             `json:"toolName,omitempty"`
+	ToolArgs    string             `json:"toolArgs,omitempty"`
+	Status      string             `json:"status,omitempty"`
+	Suggestions []actionSuggestion `json:"suggestions,omitempty"`
 }
 
 func main() {
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 	log.Println("agent-runner starting")
+
+	initApprovalPolicy()
 
 	task := getEnv("TASK", "")
 	if task == "" {
@@ -171,6 +183,23 @@ func main() {
 		}
 	}
 
+	systemPrompt += "\n\n## Suggested Actions (MANDATORY FORMAT)\n\n" +
+		"IMPORTANT: NEVER write follow-up suggestions, next steps, or offers as inline text " +
+		"(e.g. \"I can next...\", \"Would you like me to...\", \"If you want, I can...\", bullet lists of options). " +
+		"The user interface renders suggestions as clickable buttons ONLY when you use the marker format below. " +
+		"Inline text suggestions are NOT clickable and create a poor experience.\n\n" +
+		"Instead, ALWAYS use this marker block at the very end of your response:\n" +
+		"__SYMPOZIUM_ACTIONS__\n" +
+		"[{\"label\":\"Check version\",\"prompt\":\"Check the currently installed version of the operator and compare it with the latest available version in the catalog\"}" +
+		",{\"label\":\"Run security scan\",\"prompt\":\"Run a comprehensive CVE security scan on all container images used by the application in this namespace\"}]\n" +
+		"__SYMPOZIUM_ACTIONS_END__\n\n" +
+		"Rules:\n" +
+		"- Labels: concise imperative phrases (2-6 words) for button text.\n" +
+		"- Prompts: detailed enough for the agent to act on without ambiguity.\n" +
+		"- Include 2-4 suggestions maximum.\n" +
+		"- Omit the block entirely if no follow-up actions apply.\n" +
+		"- End your visible response text BEFORE the marker block. Do NOT list the options in prose."
+
 	apiKey := firstNonEmpty(
 		os.Getenv("API_KEY"),
 		os.Getenv("OPENAI_API_KEY"),
@@ -278,19 +307,15 @@ func main() {
 		}
 	}
 
-	// Strip memory markers from the response so they don't appear in the
+	// Strip internal markers from the response so they don't appear in the
 	// TUI feed or channel messages. Keep them only if DEBUG is enabled.
 	if !debugMode && res.Response != "" {
 		res.Response = stripMemoryMarkers(res.Response)
+		res.Response = stripActionMarkers(res.Response)
 	}
 
-	if res.Response != "" {
-		writeJSON("/ipc/output/stream-0.json", streamChunk{
-			Type:    "text",
-			Content: res.Response,
-			Index:   0,
-		})
-	}
+	// Stream chunks are written incrementally during the LLM call by the
+	// streamWriter, so no bulk stream-0.json is needed here.
 
 	writeJSON("/ipc/output/result.json", res)
 
@@ -321,10 +346,9 @@ func main() {
 	log.Println("agent-runner finished successfully")
 }
 
-// callAnthropic uses the official Anthropic Go SDK with optional tool calling.
-// When tools is non-empty, the function enters a loop: call the LLM, execute
-// any tool_use blocks, feed results back, and repeat until the model produces
-// a final text response or the iteration limit is reached.
+// callAnthropic uses the official Anthropic Go SDK with streaming and optional
+// tool calling. Text deltas are written as incremental stream-N.json files for
+// real-time UI updates.
 func callAnthropic(ctx context.Context, apiKey, baseURL, model, systemPrompt, task string, tools []ToolDef) (string, int, int, int, error) {
 	opts := []anthropicoption.RequestOption{
 		anthropicoption.WithMaxRetries(5),
@@ -359,8 +383,15 @@ func callAnthropic(ctx context.Context, apiKey, baseURL, model, systemPrompt, ta
 	totalInputTokens := 0
 	totalOutputTokens := 0
 	totalToolCalls := 0
+	sw := &streamWriter{}
+	statusIdx := 0
 
 	for i := 0; i < maxToolIterations; i++ {
+		statusID := fmt.Sprintf("status-%d", statusIdx)
+		if i == 0 {
+			sw.EmitToolCall(statusID, "Analyzing", "")
+		}
+
 		params := anthropic.MessageNewParams{
 			Model:     anthropic.Model(model),
 			MaxTokens: int64(8192),
@@ -377,8 +408,24 @@ func callAnthropic(ctx context.Context, apiKey, baseURL, model, systemPrompt, ta
 			attribute.String("gen_ai.system", "anthropic"),
 			attribute.String("gen_ai.request.model", model),
 		)
-		message, err := client.Messages.New(chatCtx, params)
-		if err != nil {
+
+		stream := client.Messages.NewStreaming(chatCtx, params)
+		message := anthropic.Message{}
+
+		for stream.Next() {
+			event := stream.Current()
+			_ = message.Accumulate(event)
+
+			switch ev := event.AsAny().(type) {
+			case anthropic.ContentBlockDeltaEvent:
+				switch delta := ev.Delta.AsAny().(type) {
+				case anthropic.TextDelta:
+					sw.Write(delta.Text)
+				}
+			}
+		}
+
+		if err := stream.Err(); err != nil {
 			markSpanError(chatSpan, err)
 			chatSpan.End()
 			var apiErr *anthropic.Error
@@ -400,7 +447,6 @@ func callAnthropic(ctx context.Context, apiKey, baseURL, model, systemPrompt, ta
 		chatSpan.SetStatus(codes.Ok, "")
 		chatSpan.End()
 
-		// Separate text blocks and tool-use blocks.
 		var textContent strings.Builder
 		var toolUseBlocks []anthropic.ToolUseBlock
 		for _, block := range message.Content {
@@ -412,34 +458,35 @@ func callAnthropic(ctx context.Context, apiKey, baseURL, model, systemPrompt, ta
 			}
 		}
 
-		// If no tool calls, return the text.
 		if message.StopReason != anthropic.StopReasonToolUse || len(toolUseBlocks) == 0 {
+			sw.EmitToolResult(statusID, "success", "")
+			sw.Flush()
 			return textContent.String(), totalInputTokens, totalOutputTokens, totalToolCalls, nil
 		}
 
-		// Build the assistant message with all content blocks (text + tool_use).
-		var assistantBlocks []anthropic.ContentBlockParamUnion
-		for _, block := range message.Content {
-			switch v := block.AsAny().(type) {
-			case anthropic.TextBlock:
-				assistantBlocks = append(assistantBlocks, anthropic.NewTextBlock(v.Text))
-			case anthropic.ToolUseBlock:
-				assistantBlocks = append(assistantBlocks,
-					anthropic.NewToolUseBlock(v.ID, json.RawMessage(v.Input), v.Name))
-			}
-		}
-		messages = append(messages, anthropic.NewAssistantMessage(assistantBlocks...))
+		sw.EmitToolResult(statusID, "success", "")
 
-		// Execute each tool call and build tool_result blocks.
+		// Build the assistant message from accumulated content blocks.
+		messages = append(messages, message.ToParam())
+
 		var resultBlocks []anthropic.ContentBlockParamUnion
 		for _, tu := range toolUseBlocks {
 			totalToolCalls++
 			log.Printf("tool_use [%d]: %s id=%s", totalToolCalls, tu.Name, tu.ID)
 
+			sw.EmitToolCall(tu.ID, tu.Name, string(tu.Input))
 			result := executeToolCallWithTelemetry(ctx, tu.Name, string(tu.Input), tu.ID)
 			isErr := strings.HasPrefix(result, "Error:")
+			status := "success"
+			if isErr {
+				status = "error"
+			}
+			sw.EmitToolResult(tu.ID, status, result)
 			resultBlocks = append(resultBlocks, anthropic.NewToolResultBlock(tu.ID, result, isErr))
 		}
+		statusIdx++
+		statusID = fmt.Sprintf("status-%d", statusIdx)
+		sw.EmitToolCall(statusID, "Reasoning", "")
 		messages = append(messages, anthropic.NewUserMessage(resultBlocks...))
 	}
 
@@ -447,10 +494,9 @@ func callAnthropic(ctx context.Context, apiKey, baseURL, model, systemPrompt, ta
 		fmt.Errorf("exceeded maximum tool-call iterations (%d)", maxToolIterations)
 }
 
-// callOpenAI uses the official OpenAI Go SDK with optional tool calling.
-// When tools is non-empty, the function enters a loop: call the LLM, execute
-// any tool_calls, feed results back, and repeat until the model produces a
-// final text response or the iteration limit is reached.
+// callOpenAI uses the official OpenAI Go SDK with streaming and optional tool
+// calling. Text deltas are written as incremental stream-N.json files that the
+// IPC bridge picks up and publishes to NATS for real-time UI updates.
 func callOpenAI(ctx context.Context, provider, apiKey, baseURL, model, systemPrompt, task string, tools []ToolDef) (string, int, int, int, error) {
 	opts := []openaioption.RequestOption{
 		openaioption.WithMaxRetries(5),
@@ -499,11 +545,21 @@ func callOpenAI(ctx context.Context, provider, apiKey, baseURL, model, systemPro
 	totalInputTokens := 0
 	totalOutputTokens := 0
 	totalToolCalls := 0
+	sw := &streamWriter{}
+	statusIdx := 0
 
 	for i := 0; i < maxToolIterations; i++ {
+		statusID := fmt.Sprintf("status-%d", statusIdx)
+		if i == 0 {
+			sw.EmitToolCall(statusID, "Analyzing", "")
+		}
+
 		params := openai.ChatCompletionNewParams{
 			Model:    openai.ChatModel(model),
 			Messages: messages,
+			StreamOptions: openai.ChatCompletionStreamOptionsParam{
+				IncludeUsage: openai.Bool(true),
+			},
 		}
 		if len(oaiTools) > 0 {
 			params.Tools = oaiTools
@@ -513,8 +569,20 @@ func callOpenAI(ctx context.Context, provider, apiKey, baseURL, model, systemPro
 			attribute.String("gen_ai.system", provider),
 			attribute.String("gen_ai.request.model", model),
 		)
-		completion, err := client.Chat.Completions.New(chatCtx, params)
-		if err != nil {
+
+		stream := client.Chat.Completions.NewStreaming(chatCtx, params)
+		acc := openai.ChatCompletionAccumulator{}
+
+		for stream.Next() {
+			chunk := stream.Current()
+			acc.AddChunk(chunk)
+
+			if len(chunk.Choices) > 0 && chunk.Choices[0].Delta.Content != "" {
+				sw.Write(chunk.Choices[0].Delta.Content)
+			}
+		}
+
+		if err := stream.Err(); err != nil {
 			markSpanError(chatSpan, err)
 			chatSpan.End()
 			var apiErr *openai.Error
@@ -526,42 +594,49 @@ func callOpenAI(ctx context.Context, provider, apiKey, baseURL, model, systemPro
 				fmt.Errorf("OpenAI API error: %w", err)
 		}
 
-		totalInputTokens += int(completion.Usage.PromptTokens)
-		totalOutputTokens += int(completion.Usage.CompletionTokens)
+		totalInputTokens += int(acc.Usage.PromptTokens)
+		totalOutputTokens += int(acc.Usage.CompletionTokens)
 		chatSpan.SetAttributes(
-			attribute.Int("gen_ai.usage.input_tokens", int(completion.Usage.PromptTokens)),
-			attribute.Int("gen_ai.usage.output_tokens", int(completion.Usage.CompletionTokens)),
+			attribute.Int("gen_ai.usage.input_tokens", int(acc.Usage.PromptTokens)),
+			attribute.Int("gen_ai.usage.output_tokens", int(acc.Usage.CompletionTokens)),
 		)
 
-		if len(completion.Choices) == 0 {
+		if len(acc.Choices) == 0 {
 			markSpanError(chatSpan, fmt.Errorf("no choices in completion response"))
 			chatSpan.End()
 			return "", totalInputTokens, totalOutputTokens, totalToolCalls,
 				fmt.Errorf("no choices in completion response")
 		}
-		choice := completion.Choices[0]
+		choice := acc.Choices[0]
 		chatSpan.SetAttributes(attribute.String("gen_ai.response.finish_reasons", choice.FinishReason))
 		chatSpan.SetStatus(codes.Ok, "")
 		chatSpan.End()
 
-		// If model made tool calls, execute them and loop.
 		if choice.FinishReason == "tool_calls" && len(choice.Message.ToolCalls) > 0 {
-			// Add the assistant message (with tool calls) to history.
+			sw.EmitToolResult(statusID, "success", "")
 			messages = append(messages, choice.Message.ToParam())
 
-			// Execute each tool call and add results.
 			for _, tc := range choice.Message.ToolCalls {
-				fc := tc.AsFunction()
 				totalToolCalls++
-				log.Printf("tool_call [%d]: %s id=%s", totalToolCalls, fc.Function.Name, fc.ID)
+				log.Printf("tool_call [%d]: %s id=%s", totalToolCalls, tc.Function.Name, tc.ID)
 
-				result := executeToolCallWithTelemetry(ctx, fc.Function.Name, fc.Function.Arguments, fc.ID)
-				messages = append(messages, openai.ToolMessage(result, fc.ID))
+				sw.EmitToolCall(tc.ID, tc.Function.Name, tc.Function.Arguments)
+				result := executeToolCallWithTelemetry(ctx, tc.Function.Name, tc.Function.Arguments, tc.ID)
+				status := "success"
+				if strings.HasPrefix(result, "Error:") {
+					status = "error"
+				}
+				sw.EmitToolResult(tc.ID, status, result)
+				messages = append(messages, openai.ToolMessage(result, tc.ID))
 			}
+			statusIdx++
+			statusID = fmt.Sprintf("status-%d", statusIdx)
+			sw.EmitToolCall(statusID, "Reasoning", "")
 			continue
 		}
 
-		// No tool calls — return the text response.
+		sw.EmitToolResult(statusID, "success", "")
+		sw.Flush()
 		return choice.Message.Content, totalInputTokens, totalOutputTokens, totalToolCalls, nil
 	}
 
@@ -641,9 +716,15 @@ func extractMemoryUpdate(response string) string {
 // stripMemoryMarkers removes all __SYMPOZIUM_MEMORY__...END__ blocks from the
 // response text so they don't appear in the TUI feed or channel messages.
 func stripMemoryMarkers(response string) string {
-	const startMarker = "__SYMPOZIUM_MEMORY__"
-	const endMarker = "__SYMPOZIUM_MEMORY_END__"
+	return stripMarkerBlocks(response, "__SYMPOZIUM_MEMORY__", "__SYMPOZIUM_MEMORY_END__")
+}
 
+// stripActionMarkers removes all __SYMPOZIUM_ACTIONS__...END__ blocks.
+func stripActionMarkers(response string) string {
+	return stripMarkerBlocks(response, "__SYMPOZIUM_ACTIONS__", "__SYMPOZIUM_ACTIONS_END__")
+}
+
+func stripMarkerBlocks(response, startMarker, endMarker string) string {
 	for {
 		startIdx := strings.Index(response, startMarker)
 		if startIdx < 0 {
@@ -651,11 +732,9 @@ func stripMemoryMarkers(response string) string {
 		}
 		endIdx := strings.Index(response[startIdx:], endMarker)
 		if endIdx < 0 {
-			// Unclosed marker — strip from startMarker to end of string.
 			response = strings.TrimSpace(response[:startIdx])
 			break
 		}
-		// Remove the entire marker block.
 		response = response[:startIdx] + response[startIdx+endIdx+len(endMarker):]
 	}
 	return strings.TrimSpace(response)

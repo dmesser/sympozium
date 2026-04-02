@@ -1,0 +1,86 @@
+---
+# Sympozium SkillPack: OpenShift Observability Agent
+# Specialised in querying Prometheus/Grafana, reading cluster logs,
+# and tracing performance bottlenecks.
+apiVersion: sympozium.ai/v1alpha1
+kind: SkillPack
+metadata:
+  name: openshift-observability
+  namespace: sympozium-system
+  labels:
+    sympozium.ai/builtin: "true"
+    sympozium.ai/category: openshift
+spec:
+  category: openshift
+  version: "0.1.0"
+  source: builtin
+  skills:
+    - name: log-analysis
+      description: Analyse pod logs, events, and metrics to diagnose issues
+      content: |
+        # OpenShift Observability — Log & Event Analysis
+
+        ## Investigation Steps
+        1. Failing pods: `oc get pods -n <ns> --field-selector=status.phase!=Running,status.phase!=Succeeded`
+        2. Events: `oc get events -n <ns> --sort-by=.lastTimestamp | tail -30`
+        3. Logs: `oc logs <pod> -n <ns> --tail=100` (add `--previous` for crashes)
+        4. Resources: `oc adm top pods -n <ns>` / `oc adm top nodes`
+        5. Prometheus: `oc -n openshift-monitoring exec -c prometheus prometheus-k8s-0 -- curl -s 'http://localhost:9090/api/v1/query?query=<promql>'`
+           Key PromQL: `kube_pod_container_status_restarts_total`, `container_memory_working_set_bytes`
+        6. Network: `oc exec <pod> -n <ns> -- curl -sv <service>:<port>`
+
+        For network/RBAC issues, state findings and recommend security skill.
+
+        Report: **Symptom** → **Evidence** → **Root Cause** → **Recommendation**
+      requires:
+        bins:
+          - oc
+          - kubectl
+          - curl
+        tools:
+          - bash
+          - read_file
+
+    - name: alerting-review
+      description: Review and triage OpenShift alerts
+      content: |
+        # OpenShift Observability — Alert Review
+
+        Firing alerts: `oc -n openshift-monitoring exec -c prometheus prometheus-k8s-0 -- curl -s http://localhost:9090/api/v1/alerts | python3 -m json.tool`
+
+        Key alerts: KubePodCrashLooping→logs, KubePodNotReady→probes, NodeNotReady→kubelet, HighMemoryUsage→limits.
+        Priority: Critical=immediate, Warning=current session, Info=awareness.
+      requires:
+        bins:
+          - oc
+        tools:
+          - bash
+  sidecar:
+    image: ghcr.io/sympozium-ai/sympozium/skill-k8s-ops:latest
+    mountWorkspace: true
+    resources:
+      cpu: "100m"
+      memory: "512Mi"
+    rbac:
+      - apiGroups: [""]
+        resources: ["pods", "pods/log", "pods/exec", "services", "configmaps", "events", "endpoints"]
+        verbs: ["get", "list", "watch"]
+      - apiGroups: ["apps"]
+        resources: ["deployments", "statefulsets", "replicasets", "daemonsets"]
+        verbs: ["get", "list", "watch"]
+      - apiGroups: ["batch"]
+        resources: ["jobs", "cronjobs"]
+        verbs: ["get", "list", "watch"]
+      - apiGroups: ["monitoring.coreos.com"]
+        resources: ["prometheuses", "alertmanagers", "servicemonitors", "prometheusrules"]
+        verbs: ["get", "list", "watch"]
+    clusterRBAC:
+      - apiGroups: [""]
+        resources: ["nodes", "namespaces", "pods", "pods/log", "services", "events"]
+        verbs: ["get", "list", "watch"]
+      - apiGroups: ["apps"]
+        resources: ["deployments", "statefulsets", "replicasets", "daemonsets"]
+        verbs: ["get", "list", "watch"]
+      - apiGroups: ["monitoring.coreos.com"]
+        resources: ["prometheuses", "alertmanagers", "servicemonitors", "prometheusrules"]
+        verbs: ["get", "list", "watch"]

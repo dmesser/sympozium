@@ -276,7 +276,7 @@ run-controller-inner: build-controller
 
 ##@ Docker
 
-DOCKER_PLATFORMS ?= linux/amd64,linux/arm64
+DOCKER_PLATFORMS ?= linux/amd64
 
 docker-build: $(addprefix docker-build-,$(IMAGES)) ## Build all Docker images (native arch)
 

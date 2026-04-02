@@ -1,0 +1,35 @@
+---
+# Sympozium SkillPack: OpenShift Lightspeed Skill Routing Guide
+# Lightweight preamble that helps the LLM focus on the relevant loaded
+# skills without spawning sub-agents.
+apiVersion: sympozium.ai/v1alpha1
+kind: SkillPack
+metadata:
+  name: openshift-router
+  namespace: sympozium-system
+  labels:
+    sympozium.ai/builtin: "true"
+    sympozium.ai/category: openshift
+spec:
+  category: openshift
+  version: "0.2.0"
+  source: builtin
+  skills:
+    - name: skill-routing-guide
+      description: Guides the LLM to identify and follow the most relevant loaded skill instructions
+      content: |
+        # OpenShift Lightspeed -- Skill Routing Guide
+
+        You have multiple skill documents loaded below. Before responding:
+
+        1. Scan the loaded skill names and descriptions.
+        2. Identify which skill(s) are relevant to the user's request.
+        3. Follow ONLY the instructions from the matching skill(s).
+           Ignore unrelated skill instructions to stay focused.
+        4. For cross-domain requests, address each relevant skill's
+           domain sequentially within your response.
+
+        If no loaded skill clearly matches, use general OpenShift
+        knowledge and the available CLI tools.
+
+        ALL state-changing commands MUST be presented for user approval.

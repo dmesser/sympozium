@@ -79,6 +79,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	imageRegistry := os.Getenv("SYMPOZIUM_IMAGE_REGISTRY")
+	if envTag := os.Getenv("SYMPOZIUM_IMAGE_TAG"); envTag != "" {
+		imageTag = envTag
+	}
+
 	// Set up the PodBuilder used by AgentRunReconciler
 	podBuilder := orchestrator.NewPodBuilder(imageTag)
 
@@ -123,6 +128,7 @@ func main() {
 		Log:             ctrl.Log.WithName("controllers").WithName("AgentRun"),
 		PodBuilder:      podBuilder,
 		Clientset:       clientset,
+		ImageRegistry:   imageRegistry,
 		ImageTag:        imageTag,
 		RunHistoryLimit: maxRunHistory,
 		DynamicClient:   dynamicClient,
@@ -212,6 +218,25 @@ func main() {
 			}
 			if err := mgr.Add(schedRouter); err != nil {
 				setupLog.Error(err, "unable to add schedule router")
+				os.Exit(1)
+			}
+
+			spawnRouter := &controller.SpawnRouter{
+				Client:   mgr.GetClient(),
+				EventBus: eb,
+				Log:      ctrl.Log.WithName("spawn-router"),
+			}
+			if err := mgr.Add(spawnRouter); err != nil {
+				setupLog.Error(err, "unable to add spawn router")
+				os.Exit(1)
+			}
+
+			approvalRouter := &controller.ApprovalRouter{
+				EventBus: eb,
+				Log:      ctrl.Log.WithName("approval-router"),
+			}
+			if err := mgr.Add(approvalRouter); err != nil {
+				setupLog.Error(err, "unable to add approval router")
 				os.Exit(1)
 			}
 

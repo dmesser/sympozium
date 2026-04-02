@@ -72,6 +72,7 @@ type AgentRunReconciler struct {
 	Log             logr.Logger
 	PodBuilder      *orchestrator.PodBuilder
 	Clientset       kubernetes.Interface
+	ImageRegistry   string // container registry for Sympozium images (e.g. "quay.io/myorg")
 	ImageTag        string // release tag for Sympozium images (e.g. "v0.0.25")
 	RunHistoryLimit int    // max completed runs to keep per instance (0 = use default)
 
@@ -80,15 +81,20 @@ type AgentRunReconciler struct {
 	DynamicClient dynamic.Interface
 }
 
-const imageRegistry = "ghcr.io/sympozium-ai/sympozium"
+const defaultImageRegistry = "ghcr.io/sympozium-ai/sympozium"
 
-// imageRef returns a fully qualified image reference using the reconciler's tag.
+// imageRef returns a fully qualified image reference using the reconciler's
+// registry and tag. The registry defaults to the upstream ghcr.io path.
 func (r *AgentRunReconciler) imageRef(name string) string {
+	registry := r.ImageRegistry
+	if registry == "" {
+		registry = defaultImageRegistry
+	}
 	tag := r.ImageTag
 	if tag == "" {
 		tag = "latest"
 	}
-	return fmt.Sprintf("%s/%s:%s", imageRegistry, name, tag)
+	return fmt.Sprintf("%s/%s:%s", registry, name, tag)
 }
 
 // resolveOTelEndpoint returns the OTLP endpoint for agent pods.
@@ -781,7 +787,7 @@ func (r *AgentRunReconciler) reconcilePendingServer(ctx context.Context, log log
 	labels := map[string]string{
 		"sympozium.ai/agent-run":       agentRun.Name,
 		"sympozium.ai/instance":        agentRun.Spec.InstanceRef,
-		"sympozium.ai/component":       "agent-server",
+		"sympozium.ai/component":       "web-proxy",
 		"app.kubernetes.io/part-of":    "sympozium",
 		"app.kubernetes.io/managed-by": "sympozium-controller",
 	}
@@ -1204,7 +1210,8 @@ func (r *AgentRunReconciler) ensureAgentServiceAccount(ctx context.Context, name
 }
 
 // seccompProfileForPod determines the pod-level seccomp profile.
-// Priority: AgentRun spec > default (RuntimeDefault).
+// Returns the profile from the AgentRun spec if set, otherwise nil so that
+// the platform (e.g. OpenShift SCCs) can manage it.
 func seccompProfileForPod(agentRun *sympoziumv1alpha1.AgentRun) *corev1.SeccompProfile {
 	if agentRun.Spec.Sandbox != nil &&
 		agentRun.Spec.Sandbox.SecurityContext != nil &&
@@ -1213,9 +1220,7 @@ func seccompProfileForPod(agentRun *sympoziumv1alpha1.AgentRun) *corev1.SeccompP
 			Type: corev1.SeccompProfileType(agentRun.Spec.Sandbox.SecurityContext.SeccompProfile.Type),
 		}
 	}
-	return &corev1.SeccompProfile{
-		Type: corev1.SeccompProfileTypeRuntimeDefault,
-	}
+	return nil
 }
 
 // buildJob constructs the Kubernetes Job for an AgentRun.
@@ -1350,19 +1355,7 @@ func (r *AgentRunReconciler) buildContainers(
 					Drop: []corev1.Capability{"ALL"},
 				},
 			},
-			Env: []corev1.EnvVar{
-				{Name: "AGENT_RUN_ID", Value: agentRun.Name},
-				{Name: "AGENT_ID", Value: agentRun.Spec.AgentID},
-				{Name: "SESSION_KEY", Value: agentRun.Spec.SessionKey},
-				{Name: "INSTANCE_NAME", Value: agentRun.Spec.InstanceRef},
-				{Name: "AGENT_NAMESPACE", Value: agentRun.Namespace},
-				{Name: "TASK", Value: agentRun.Spec.Task},
-				{Name: "SYSTEM_PROMPT", Value: agentRun.Spec.SystemPrompt},
-				{Name: "MODEL_PROVIDER", Value: agentRun.Spec.Model.Provider},
-				{Name: "MODEL_NAME", Value: agentRun.Spec.Model.Model},
-				{Name: "MODEL_BASE_URL", Value: agentRun.Spec.Model.BaseURL},
-				{Name: "THINKING_MODE", Value: agentRun.Spec.Model.Thinking},
-			},
+			Env: buildAgentContainerEnv(agentRun),
 			VolumeMounts: []corev1.VolumeMount{
 				{Name: "workspace", MountPath: "/workspace"},
 				{Name: "skills", MountPath: "/skills", ReadOnly: true},
@@ -1812,6 +1805,31 @@ func buildObservabilityEnv(agentRun *sympoziumv1alpha1.AgentRun, obs *sympoziumv
 		)
 	}
 
+	return env
+}
+
+// buildAgentContainerEnv constructs the env var list for the main agent container,
+// including the TOOL_POLICY_ASK env var when the run has ask-gated tools.
+func buildAgentContainerEnv(agentRun *sympoziumv1alpha1.AgentRun) []corev1.EnvVar {
+	env := []corev1.EnvVar{
+		{Name: "AGENT_RUN_ID", Value: agentRun.Name},
+		{Name: "AGENT_ID", Value: agentRun.Spec.AgentID},
+		{Name: "SESSION_KEY", Value: agentRun.Spec.SessionKey},
+		{Name: "INSTANCE_NAME", Value: agentRun.Spec.InstanceRef},
+		{Name: "AGENT_NAMESPACE", Value: agentRun.Namespace},
+		{Name: "TASK", Value: agentRun.Spec.Task},
+		{Name: "SYSTEM_PROMPT", Value: agentRun.Spec.SystemPrompt},
+		{Name: "MODEL_PROVIDER", Value: agentRun.Spec.Model.Provider},
+		{Name: "MODEL_NAME", Value: agentRun.Spec.Model.Model},
+		{Name: "MODEL_BASE_URL", Value: agentRun.Spec.Model.BaseURL},
+		{Name: "THINKING_MODE", Value: agentRun.Spec.Model.Thinking},
+	}
+	if agentRun.Spec.ToolPolicy != nil && len(agentRun.Spec.ToolPolicy.Ask) > 0 {
+		env = append(env, corev1.EnvVar{
+			Name:  "TOOL_POLICY_ASK",
+			Value: strings.Join(agentRun.Spec.ToolPolicy.Ask, ","),
+		})
+	}
 	return env
 }
 

@@ -153,8 +153,6 @@ defaultPersonas:
 # -- Pod security context (applied to all control plane pods)
 securityContext:
   runAsNonRoot: true
-  seccompProfile:
-    type: RuntimeDefault
 
 # -- Container security context (applied to all control plane containers)
 containerSecurityContext:
@@ -311,6 +309,26 @@ agentSandbox:
   # -- Create RBAC rules allowing the controller to manage Sandbox, SandboxClaim,
   # and SandboxWarmPool CRs (apiGroup: agents.x-k8s.io).
   rbac: true
+
+# -- OpenShift Lightspeed multi-agent integration.
+# Deploys a SympoziumInstance with a semantic router and four domain-specific
+# SkillPacks (observability, security, platform, software-catalog) plus a
+# SympoziumPolicy with human-in-the-loop tool gating.
+openshiftLightspeed:
+  enabled: false
+  # -- LLM model name
+  model: "gpt-4o"
+  # -- LLM provider (openai, anthropic, azure-openai, etc.)
+  provider: "openai"
+  # -- Override base URL for OpenAI-compatible providers
+  baseURL: ""
+  # -- K8s Secret name containing the LLM API key
+  authSecret: "openshift-lightspeed-llm-key"
+  # -- MCP servers to connect to (list of MCPServerRef)
+  mcpServers: []
+  # -- Web endpoint configuration
+  webEndpoint:
+    hostname: ""
 
 # -- ServiceMonitor for Prometheus (requires prometheus-operator)
 serviceMonitor:

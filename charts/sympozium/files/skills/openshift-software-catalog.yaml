@@ -1,0 +1,231 @@
+---
+# Sympozium SkillPack: OpenShift Software Catalog Agent
+# Specialised in querying OLM operator catalogs, Helm chart repositories,
+# and registry.redhat.io to find software versions and updates.
+apiVersion: sympozium.ai/v1alpha1
+kind: SkillPack
+metadata:
+  name: openshift-software-catalog
+  namespace: sympozium-system
+  labels:
+    sympozium.ai/builtin: "true"
+    sympozium.ai/category: openshift
+spec:
+  category: openshift
+  version: "0.1.0"
+  source: builtin
+  skills:
+    - name: operator-catalog
+      description: Query OLM operator catalogs for available operators and versions
+      content: |
+        # OpenShift Software Catalog — Operator Catalog
+
+        Query OLM to find available software, versions, and updates.
+
+        **CRITICAL: For operators, ALWAYS use the PackageManifest API.
+        NEVER use `newer-image.sh` or `skopeo` — operator images use
+        digest refs and non-semver tags.**
+
+        ## Key Commands
+        ```
+        oc get subscriptions -A -o json | jq -r '.items[] |
+          "\(.metadata.namespace)\t\(.spec.name)\t\(.spec.channel)\t\(.status.installedCSV)"'
+        oc get packagemanifest <pkg> -o json | jq '{
+          defaultChannel: .status.defaultChannel,
+          channels: [.status.channels[] | {name, currentCSV, version: .currentCSVDesc.version}]}'
+        ```
+
+        ## Newer Version Detection
+        1. If Subscription `.status.currentCSV != .status.installedCSV`, an update is pending.
+        2. Compare versions across all PackageManifest channels for newer streams.
+        3. Check unapproved InstallPlans: `oc get installplans -n <ns> -o json | jq '[.items[] | select(.spec.approved==false)]'`
+
+        ## Report Format
+        **Operator:** `<name>` in `<ns>` | **Installed:** `<csv>` (channel: `<ch>`)
+
+        | Channel | Version | Status |
+        |---------|---------|--------|
+        | `<ch>` | `<csv>` | ✅ Current / ⬆️ Update / 🆕 Newer channel |
+
+    - name: operator-update
+      description: Update an installed operator to a newer version via OLM
+      content: |
+        # OpenShift Software Catalog — Operator Update
+
+        Use OLM APIs only. Never use `newer-image.sh` for operators.
+
+        ## Procedure
+        1. Find Subscription: `oc get subscriptions -A` → note `spec.name`, `spec.channel`, installed CSV.
+        2. Query PackageManifest (use `spec.name`): `oc get packagemanifest <pkg> -o json | jq '{defaultChannel: .status.defaultChannel, channels: [.status.channels[] | {name, currentCSV, version: .currentCSVDesc.version}]}'`
+        3. **Channel switch:** `oc patch subscription <name> -n <ns> --type merge -p '{"spec":{"channel":"<new>"}}'`
+        4. **Approve InstallPlan:** `oc patch installplan <ip> -n <ns> --type merge -p '{"spec":{"approved":true}}'`
+        5. Verify: `oc get csv -n <ns> | grep <operator>`
+
+        Present plan before execution: Current vs Target channel/CSV.
+        ALL update commands require user approval. Never delete a Subscription to update.
+      requires:
+        bins: [oc, jq]
+        tools: [bash]
+
+    - name: operator-install
+      description: Install a new operator from the OLM catalog
+      content: |
+        # OpenShift Software Catalog — Operator Install
+
+        ## Procedure
+        1. **Search:** `oc get packagemanifests | grep -i <keyword>`
+           Details: `oc get packagemanifest <pkg> -o json | jq '{name: .metadata.name, catalog: .status.catalogSource, defaultChannel: .status.defaultChannel, channels: [.status.channels[] | {name, currentCSV}]}'`
+        2. **Check installModes** (mandatory — determines OperatorGroup config):
+           `oc get packagemanifest <pkg> -o json | jq '[.status.channels[] | select(.name=="<ch>") | .currentCSVDesc.installModes[] | select(.supported) | .type] | unique'`
+        3. **Present plan** to user: operator name, catalog, channel, namespace, install mode.
+        4. **Create resources in order:**
+           a) Namespace: `oc create namespace <ns>` (if needed)
+           b) OperatorGroup (check first: `oc get operatorgroups -n <ns>`; max 1 per namespace):
+              - **AllNamespaces**: `spec: {}` (empty targetNamespaces)
+              - **OwnNamespace/SingleNamespace**: `spec.targetNamespaces: [<ns>]`
+           c) Subscription (only after OperatorGroup exists):
+              apiVersion `operators.coreos.com/v1alpha1`, kind `Subscription` with
+              `channel`, `name` (package), `source`, `sourceNamespace: openshift-marketplace`,
+              `installPlanApproval: Automatic`
+        5. **Wait:** `watch-cr-status.sh clusterserviceversion <csv> -n <ns> --timeout 180`
+        6. **Confirm:** `oc get csv -n <ns>`
+
+        OperatorGroup MUST exist before Subscription. Never create a second OperatorGroup.
+        ALL commands require user approval.
+      requires:
+        bins: [oc, jq]
+        tools: [bash]
+
+    - name: operator-cr-deploy
+      description: Deploy an operator-managed custom resource instance
+      content: |
+        # OpenShift Software Catalog — Operator CR Deploy
+
+        Use after an operator is installed to create an operand instance.
+
+        ## Procedure
+        1. **Discover CRDs:** `oc get csv <csv> -n <ns> -o json | jq '{crds: [.spec.customresourcedefinitions.owned[] | {kind, name, version}]}'`
+        2. **Get example CR** (best source): `oc get csv <csv> -n <ns> -o json | jq -r '.metadata.annotations["alm-examples"]' | jq .`
+           Always start from `alm-examples` — never invent CR specs.
+        3. **Propose YAML** to user for approval.
+        4. **Apply and watch:** `oc apply -f -` then `watch-cr-status.sh <kind> <name> -n <ns> --timeout 300`
+           Fallback: `oc get <kind> <name> -n <ns> -o json | jq '{state: .status.state, phase: .status.phase, conditions: [.status.conditions[]? | {type, status, message}]}'` (poll every 15s)
+        5. **Report:** instance name, namespace, connection details from status.
+
+        ALL YAML must be presented for user approval. Check `oc get storageclass` if storage is needed.
+      requires:
+        bins: [oc, jq, watch-cr-status.sh]
+        tools: [bash]
+
+    - name: helm-catalog
+      description: Query Helm chart repositories and manage Helm releases
+      content: |
+        # OpenShift Software Catalog — Helm Charts
+
+        ## Key Commands
+        ```
+        helm search repo <keyword>       # search charts
+        helm list -A                      # installed releases
+        helm status <release> -n <ns>     # release details
+        ```
+
+        ## Find Release Name (NEVER guess from pod/sts names)
+        1. `helm list -n <ns>` → NAME column
+        2. From labels: `oc get all -n <ns> -o json | jq -r '[.items[].metadata.labels["app.kubernetes.io/instance"] // empty] | unique[]'`
+
+        ## Uninstall
+        `helm uninstall <release> -n <ns>` then `oc get all -n <ns>` to verify cleanup.
+
+        ## OpenShift SCC Warning
+        Community charts often set `runAsUser`/`fsGroup` that conflict with SCCs.
+        Workarounds: grant `anyuid` (quick, weakens security) or use an operator (recommended).
+
+        ALL state-changing Helm commands require user approval.
+
+    - name: image-version-check
+      description: Find newer versions of a non-operator container image using semver comparison
+      content: |
+        # OpenShift Software Catalog — Image Version Check
+
+        **Non-operator images ONLY.** For operators, use `operator-catalog` skill.
+
+        ## Usage
+        `newer-image.sh <image:tag>` — queries registry via skopeo, authenticates
+        with cluster pull-secret, does semver comparison.
+
+        List namespace images: `oc get pods -n <ns> -o jsonpath='{range .items[*]}{.spec.containers[*].image}{"\n"}{end}' | sort -u`
+
+        ## Report Format
+        | Type | Count | Latest | Risk |
+        |------|-------|--------|------|
+        | 🟢 Patch | N | `<tag>` | Low — bug fixes |
+        | 🔶 Minor | N | `<tag>` | Medium — new features |
+        | 🔴 Major | N | `<tag>` | High — breaking changes |
+
+        Omit zero-count rows. Recommend patches as safe. Highlight CVE fixes.
+        ALL update commands require user approval.
+      requires:
+        bins: [oc, skopeo, jq, newer-image.sh]
+        tools: [bash, read_file]
+  sidecar:
+    image: ghcr.io/sympozium-ai/sympozium/skill-k8s-ops:latest
+    mountWorkspace: true
+    resources:
+      cpu: "100m"
+      memory: "512Mi"
+    rbac:
+      - apiGroups: [""]
+        resources: ["pods", "services", "configmaps", "secrets", "serviceaccounts", "persistentvolumeclaims"]
+        verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+      - apiGroups: ["apps"]
+        resources: ["deployments", "statefulsets", "replicasets"]
+        verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+      - apiGroups: ["operators.coreos.com"]
+        resources: ["clusterserviceversions", "catalogsources"]
+        verbs: ["get", "list", "watch"]
+      - apiGroups: ["operators.coreos.com"]
+        resources: ["operatorgroups"]
+        verbs: ["get", "list", "watch", "create", "delete"]
+      - apiGroups: ["operators.coreos.com"]
+        resources: ["subscriptions"]
+        verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+      - apiGroups: ["operators.coreos.com"]
+        resources: ["installplans"]
+        verbs: ["get", "list", "watch", "update", "patch"]
+      - apiGroups: ["packages.operators.coreos.com"]
+        resources: ["packagemanifests"]
+        verbs: ["get", "list", "watch"]
+    clusterRBAC:
+      - apiGroups: [""]
+        resources: ["namespaces"]
+        verbs: ["get", "list", "watch", "create"]
+      - apiGroups: [""]
+        resources: ["secrets"]
+        verbs: ["get", "list", "watch"]
+      - apiGroups: ["operators.coreos.com"]
+        resources: ["clusterserviceversions", "catalogsources"]
+        verbs: ["get", "list", "watch"]
+      - apiGroups: ["operators.coreos.com"]
+        resources: ["operatorgroups"]
+        verbs: ["get", "list", "watch", "create", "delete"]
+      - apiGroups: ["operators.coreos.com"]
+        resources: ["subscriptions"]
+        verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+      - apiGroups: ["operators.coreos.com"]
+        resources: ["installplans"]
+        verbs: ["get", "list", "watch", "update", "patch"]
+      - apiGroups: ["packages.operators.coreos.com"]
+        resources: ["packagemanifests"]
+        verbs: ["get", "list", "watch"]
+      - apiGroups: ["apiextensions.k8s.io"]
+        resources: ["customresourcedefinitions"]
+        verbs: ["get", "list", "watch"]
+      - apiGroups: ["helm.openshift.io"]
+        resources: ["helmchartrepositories"]
+        verbs: ["get", "list", "watch"]
+      - apiGroups: ["app.redislabs.com"]
+        resources: ["*"]
+        verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+      - apiGroups: ["redis.redis.opstreelabs.in"]
+        resources: ["*"]
+        verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]

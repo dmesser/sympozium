@@ -1,0 +1,187 @@
+---
+# Sympozium SkillPack: OpenShift Security Agent
+# Specialised in RBAC analysis, network policies, CVE scanning,
+# compliance checks, and security context constraints.
+apiVersion: sympozium.ai/v1alpha1
+kind: SkillPack
+metadata:
+  name: openshift-security
+  namespace: sympozium-system
+  labels:
+    sympozium.ai/builtin: "true"
+    sympozium.ai/category: openshift
+spec:
+  category: openshift
+  version: "0.1.0"
+  source: builtin
+  skills:
+    - name: rbac-analysis
+      description: Analyse RBAC roles, bindings, and permissions
+      content: |
+        # OpenShift Security — RBAC Analysis
+
+        ## Key Commands
+        ```
+        oc get roles,rolebindings -n <ns>
+        oc get clusterroles,clusterrolebindings
+        oc adm policy who-can <verb> <resource> -n <ns>
+        oc auth can-i --list --as=system:serviceaccount:<ns>:<sa>
+        ```
+
+        Flag: cluster-admin on SAs, wildcard verbs/resources, stale bindings.
+        ALL remediation commands require user approval.
+
+    - name: network-policy-audit
+      description: Audit network policies and verify traffic isolation
+      content: |
+        # OpenShift Security — Network Policy Audit
+
+        `oc get networkpolicies -n <ns> -o yaml` / `oc get networkpolicies -A`
+        Check: default-deny exists, ingress/egress rules scoped properly.
+        Test: `oc exec <pod> -n <ns> -- curl -sv <service>.<target-ns>.svc:<port>`
+        ALL network policy changes require user approval.
+
+    - name: scc-review
+      description: Review Security Context Constraints and pod security
+      content: |
+        # OpenShift Security — SCC Review
+
+        `oc get scc` / `oc get pod <pod> -n <ns> -o jsonpath='{.metadata.annotations.openshift\.io/scc}'`
+        Risks: anyuid/privileged on non-essential workloads, hostPath/hostNetwork, running as root.
+        Default to restricted/restricted-v2. Custom SCCs only when justified.
+
+    - name: cve-analysis
+      description: Analyse container images for CVE vulnerabilities using ACS
+      content: |
+        # OpenShift Security — CVE Analysis (ACS)
+
+        ## Usage
+        `acs-scan.sh <image:tag>` — discovers ACS, syncs registry creds
+        from global pull-secret, runs roxctl scan. Falls back to check mode.
+
+        If ACS unavailable (JSON has `error` or `acs_installed: false`),
+        tell user and fall back to `pyxis-scan.sh` (cve-analysis-pyxis skill).
+
+        List images: `oc get pods -n <ns> -o jsonpath='{range .items[*]}{.spec.containers[*].image}{"\n"}{end}' | sort -u`
+
+        ## Default Report (summary only)
+        Unless the user explicitly asks for a "detailed" report, "full list",
+        or "list all CVEs", respond with ONLY the severity summary:
+
+        🚨 Critical: N
+        🔴 High: N
+        🟠 Medium: N
+        🟡 Low: N
+        ⚪️ Unknown/Info: N
+
+        ⚠️ Total CVEs Found: N
+
+        Use ✅ Total CVEs Found: 0 when none are found.
+        Add a brief recommendation line if critical/high CVEs exist.
+        Do NOT include the detailed table unless the user asks.
+
+        ## Detailed Report (only when asked)
+        Start with the summary above, then add:
+
+        One row per unique CVE, highest severity first, max 15:
+        | CVE | | Component | Fix |
+        |-----|---|-----------|-----|
+        | CVE-XXXX | 🔴 | pkg 1.2.3 | → 1.2.4 |
+
+        Emojis: 🔴 Critical 🟠 Important 🟡 Moderate 🔵 Low. "—" = no fix.
+        When fixes exist, check software-catalog for newer versions.
+        ALL remediation commands require user approval.
+      requires:
+        bins: [oc, curl, jq, acs-scan.sh]
+        tools: [bash, read_file]
+
+    - name: cve-comparison
+      description: Compare CVE profiles between two container images
+      content: |
+        # OpenShift Security — CVE Comparison
+
+        Scan both images with `acs-scan.sh` (or `pyxis-scan.sh` fallback).
+
+        ## Report Format
+        | Severity | Image A | Image B | Delta |
+        |----------|---------|---------|-------|
+        | 🔴 Critical | N | N | +/-N |
+        | 🟠 Important | N | N | +/-N |
+
+        Highlight CVEs fixed in the alternative and any new ones.
+        Recommend the more secure image. Suggest checking operator catalog too.
+
+    - name: cve-analysis-pyxis
+      description: Fallback CVE scanning via Red Hat Ecosystem Catalog (Pyxis) API
+      content: |
+        # OpenShift Security — CVE Analysis (Pyxis Fallback)
+
+        Use **only** when `acs-scan.sh` failed. Always tell user this is a fallback.
+        Covers Red Hat registries only (`registry.redhat.io`, `registry.access.redhat.com`).
+
+        ## Usage
+        `pyxis-scan.sh <image:tag>`
+
+        ## Default Report (summary only)
+        ⚠️ *ACS unavailable — using Red Hat Ecosystem Catalog*
+
+        Unless the user explicitly asks for details, respond with ONLY:
+
+        🚨 Critical: N
+        🔴 High: N
+        🟠 Medium: N
+        🟡 Low: N
+        ⚪️ Unknown/Info: N
+
+        ⚠️ Total CVEs Found: N
+
+        Use ✅ Total CVEs Found: 0 when none are found.
+
+        ## Detailed Report (only when asked)
+        Start with the summary above, then add:
+        | CVE | | Advisory | Fix |
+        |-----|---|----------|-----|
+        | CVE-XXXX | 🔴 | RHSA-YYYY:ZZZZ | available |
+
+        Max 15 rows. ALL remediation commands require user approval.
+      requires:
+        bins: [curl, jq, pyxis-scan.sh]
+        tools: [bash]
+  sidecar:
+    image: ghcr.io/sympozium-ai/sympozium/skill-k8s-ops:latest
+    mountWorkspace: true
+    resources:
+      cpu: "100m"
+      memory: "512Mi"
+    rbac:
+      - apiGroups: [""]
+        resources: ["pods", "pods/exec", "services", "configmaps", "secrets", "serviceaccounts"]
+        verbs: ["get", "list", "watch"]
+      - apiGroups: ["rbac.authorization.k8s.io"]
+        resources: ["roles", "rolebindings"]
+        verbs: ["get", "list", "watch", "create", "update", "patch"]
+      - apiGroups: ["networking.k8s.io"]
+        resources: ["networkpolicies"]
+        verbs: ["get", "list", "watch", "create", "update", "patch"]
+    clusterRBAC:
+      - apiGroups: [""]
+        resources: ["namespaces", "nodes", "pods", "pods/exec", "services", "serviceaccounts"]
+        verbs: ["get", "list", "watch", "create"]
+      - apiGroups: ["rbac.authorization.k8s.io"]
+        resources: ["clusterroles", "clusterrolebindings", "roles", "rolebindings"]
+        verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+      - apiGroups: ["security.openshift.io"]
+        resources: ["securitycontextconstraints"]
+        verbs: ["get", "list", "watch", "use"]
+      - apiGroups: ["networking.k8s.io"]
+        resources: ["networkpolicies"]
+        verbs: ["get", "list", "watch"]
+      - apiGroups: ["platform.stackrox.io"]
+        resources: ["centrals", "securedclusters"]
+        verbs: ["get", "list", "watch"]
+      - apiGroups: ["config.stackrox.io"]
+        resources: ["securitypolicies"]
+        verbs: ["get", "list", "watch"]
+      - apiGroups: ["operators.coreos.com"]
+        resources: ["clusterserviceversions"]
+        verbs: ["get", "list", "watch"]

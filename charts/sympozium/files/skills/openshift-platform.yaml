@@ -1,0 +1,139 @@
+---
+# Sympozium SkillPack: OpenShift Platform Management Agent
+# Understands OpenShift-specific configurations, provisioning states,
+# operator management, and cluster best practices.
+apiVersion: sympozium.ai/v1alpha1
+kind: SkillPack
+metadata:
+  name: openshift-platform
+  namespace: sympozium-system
+  labels:
+    sympozium.ai/builtin: "true"
+    sympozium.ai/category: openshift
+spec:
+  category: openshift
+  version: "0.1.0"
+  source: builtin
+  skills:
+    - name: cluster-management
+      description: Manage OpenShift cluster configuration and health
+      content: |
+        # OpenShift Platform — Cluster Management
+
+        ## Key Commands
+        ```
+        oc get clusterversion
+        oc get clusteroperators
+        oc get nodes -o wide
+        ```
+
+        Degraded operators: `oc get clusteroperators -o json | jq '.items[] | select(.status.conditions[] | select(.type=="Degraded" and .status=="True")) | .metadata.name'`
+
+        Infrastructure: `oc get infrastructure cluster -o yaml`
+        Machines: `oc get machines -n openshift-machine-api`
+        Quotas: `oc get resourcequotas -A`
+
+    - name: project-management
+      description: Manage OpenShift projects and namespaces
+      content: |
+        # OpenShift Platform — Project Management
+
+        `oc get projects` / `oc adm top pods -n <ns>` / `oc get resourcequotas -n <ns>`
+
+        ## Namespace Audit
+        Verify: ResourceQuota, LimitRange, default-deny NetworkPolicy, labels.
+        Generate `oc apply` commands for missing resources.
+        ALL state-changing commands require user approval.
+
+    - name: pod-troubleshooting
+      description: Diagnose why pods are not starting or becoming ready
+      content: |
+        # OpenShift Platform — Pod Troubleshooting
+
+        ## Diagnosis
+        ```
+        oc get pods -n <ns>
+        oc describe pod <pod> -n <ns>
+        oc get events -n <ns> --sort-by=.lastTimestamp
+        ```
+
+        ## Root Causes
+
+        **SCC violations** (`unable to validate against any security context constraint`):
+        Check: `oc get pod <pod> -n <ns> -o json | jq '[.spec.containers[] | {name, securityContext}]'`
+        Compare with: `oc get namespace <ns> -o json | jq '.metadata.annotations["openshift.io/sa.scc.uid-range"]'`
+        Fix options (present both):
+        a) Quick: `oc adm policy add-scc-to-user anyuid -z <sa> -n <ns>` ⚠️ weakens security
+        b) Recommended: use an OpenShift-certified operator instead. Suggest security scan.
+
+        **ImagePullBackOff:** `oc get events -n <ns> | grep -i pull`
+        **OOMKilled/Resources:** `oc adm top pods -n <ns>`
+        **CrashLoopBackOff:** `oc logs <pod> -n <ns> --previous`
+
+        ## Report
+        **Pod:** `<pod>` in `<ns>` | **Root cause:** 1-line | **Recommendation:** next step
+        ALL remediation commands require user approval. SCC issues → recommend security scan.
+
+    - name: upgrade-management
+      description: Check and manage OpenShift cluster upgrades
+      content: |
+        # OpenShift Platform — Upgrade Management
+
+        Current: `oc get clusterversion -o jsonpath='{.items[0].status.desired.version}'`
+        Available: `oc adm upgrade`
+        History: `oc get clusterversion -o json | jq '.items[0].status.history'`
+
+        Pre-checks: all ClusterOperators healthy, all nodes Ready, etcd healthy, no critical alerts.
+        NEVER upgrade without explicit user approval: `oc adm upgrade --to=<version>`
+      requires:
+        bins:
+          - oc
+          - kubectl
+          - jq
+        tools:
+          - bash
+          - read_file
+  sidecar:
+    image: ghcr.io/sympozium-ai/sympozium/skill-k8s-ops:latest
+    mountWorkspace: true
+    resources:
+      cpu: "100m"
+      memory: "512Mi"
+    rbac:
+      - apiGroups: [""]
+        resources: ["pods", "pods/log", "services", "configmaps", "events", "resourcequotas", "limitranges", "serviceaccounts"]
+        verbs: ["get", "list", "watch", "create", "update", "patch"]
+      - apiGroups: ["apps"]
+        resources: ["deployments", "statefulsets", "replicasets", "daemonsets"]
+        verbs: ["get", "list", "watch"]
+      - apiGroups: ["rbac.authorization.k8s.io"]
+        resources: ["roles", "rolebindings"]
+        verbs: ["get", "list", "watch", "create", "update", "patch"]
+      - apiGroups: ["project.openshift.io"]
+        resources: ["projects"]
+        verbs: ["get", "list", "watch"]
+    clusterRBAC:
+      - apiGroups: [""]
+        resources: ["nodes", "namespaces", "persistentvolumes"]
+        verbs: ["get", "list", "watch"]
+      - apiGroups: [""]
+        resources: ["namespaces"]
+        verbs: ["create"]
+      - apiGroups: ["rbac.authorization.k8s.io"]
+        resources: ["clusterroles", "clusterrolebindings"]
+        verbs: ["get", "list", "watch", "create", "update", "patch"]
+      - apiGroups: ["security.openshift.io"]
+        resources: ["securitycontextconstraints"]
+        verbs: ["get", "list", "watch", "use"]
+      - apiGroups: ["config.openshift.io"]
+        resources: ["*"]
+        verbs: ["get", "list", "watch"]
+      - apiGroups: ["operator.openshift.io"]
+        resources: ["*"]
+        verbs: ["get", "list", "watch"]
+      - apiGroups: ["machine.openshift.io"]
+        resources: ["machines", "machinesets", "machinehealthchecks"]
+        verbs: ["get", "list", "watch"]
+      - apiGroups: ["machineconfiguration.openshift.io"]
+        resources: ["machineconfigpools", "machineconfigs"]
+        verbs: ["get", "list", "watch"]

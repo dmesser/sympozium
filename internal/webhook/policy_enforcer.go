@@ -289,6 +289,8 @@ func (mpe *MutatingPolicyEnforcer) Handle(ctx context.Context, req admission.Req
 				tp.Allow = append(tp.Allow, rule.Tool)
 			case "deny":
 				tp.Deny = append(tp.Deny, rule.Tool)
+			case "ask":
+				tp.Ask = append(tp.Ask, rule.Tool)
 			}
 		}
 		run.Spec.ToolPolicy = tp

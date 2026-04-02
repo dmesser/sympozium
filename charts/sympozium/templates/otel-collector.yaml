@@ -71,8 +71,6 @@ spec:
         runAsNonRoot: true
         runAsUser: 10001
         fsGroup: 10001
-        seccompProfile:
-          type: RuntimeDefault
       containers:
         - name: otel-collector
           image: "{{ .Values.observability.collector.image.repository }}:{{ .Values.observability.collector.image.tag }}"

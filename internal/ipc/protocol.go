@@ -89,3 +89,20 @@ type StatusUpdate struct {
 	Message string `json:"message,omitempty"`
 	ToolID  string `json:"toolId,omitempty"`
 }
+
+// ApprovalRequest is written to /ipc/tools/approval-request-{id}.json
+// when the agent-runner encounters an ask-gated tool call.
+type ApprovalRequest struct {
+	ID       string          `json:"id"`
+	ToolName string          `json:"toolName"`
+	ToolArgs json.RawMessage `json:"toolArgs"`
+	Reason   string          `json:"reason"`
+}
+
+// ApprovalResponse is written to /ipc/tools/approval-response-{id}.json
+// by the IPC bridge after receiving a human decision from the controller.
+type ApprovalResponse struct {
+	ID       string `json:"id"`
+	Approved bool   `json:"approved"`
+	Message  string `json:"message,omitempty"`
+}

@@ -25,6 +25,7 @@ const (
 	ToolSendChannelMessage = "send_channel_message"
 	ToolFetchURL           = "fetch_url"
 	ToolScheduleTask       = "schedule_task"
+	ToolSpawnSubagent      = "spawn_subagent"
 )
 
 // ToolDef describes a tool for LLM function calling.
@@ -161,6 +162,28 @@ func defaultTools() []ToolDef {
 			},
 		},
 		{
+			Name: ToolSpawnSubagent,
+			Description: "Spawn a specialized sub-agent to handle a delegated task. " +
+				"Use this when the current task requires domain expertise from another skill " +
+				"(e.g. 'observability', 'security', 'platform', 'software-catalog'). " +
+				"The sub-agent runs as a separate AgentRun with its own skill context. " +
+				"The result is returned when the sub-agent completes.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"skill": map[string]any{
+						"type":        "string",
+						"description": "The skill/domain to delegate to (e.g. 'observability', 'security', 'platform', 'software-catalog').",
+					},
+					"task": map[string]any{
+						"type":        "string",
+						"description": "A self-contained task description for the sub-agent. Be specific — the sub-agent has no prior context.",
+					},
+				},
+				"required": []string{"skill", "task"},
+			},
+		},
+		{
 			Name: ToolScheduleTask,
 			Description: "Create, update, or delete a recurring scheduled task. " +
 				"Use this to set up heartbeats, periodic checks, or any repeating work. " +
@@ -202,6 +225,20 @@ func executeToolCall(ctx context.Context, name string, argsJSON string) string {
 		return fmt.Sprintf("Error parsing tool arguments: %v", err)
 	}
 
+	// Human-in-the-loop: if this tool is gated by the "ask" policy,
+	// request approval before execution.
+	if requiresApproval(name) {
+		approved, err := requestApproval(name, args)
+		if err != nil {
+			return fmt.Sprintf("Approval error for tool '%s': %v. The tool was NOT executed.", name, err)
+		}
+		if !approved {
+			return fmt.Sprintf("Tool '%s' was rejected by the user. The tool was NOT executed. "+
+				"Inform the user that the action was not taken and ask if they want to proceed differently.", name)
+		}
+		log.Printf("Tool '%s' approved by user, proceeding with execution", name)
+	}
+
 	switch name {
 	case ToolExecuteCommand:
 		return executeCommand(ctx, args)
@@ -217,6 +254,8 @@ func executeToolCall(ctx context.Context, name string, argsJSON string) string {
 		return fetchURLTool(args)
 	case ToolScheduleTask:
 		return scheduleTaskTool(args)
+	case ToolSpawnSubagent:
+		return spawnSubagentTool(args)
 	default:
 		// Check if this is a memory tool from the memory-server sidecar.
 		if isMemoryTool(name) {
@@ -826,4 +865,71 @@ func scheduleTaskTool(args map[string]any) string {
 	default:
 		return fmt.Sprintf("Schedule '%s' action '%s' submitted.", name, action)
 	}
+}
+
+// spawnSubagentTool writes a spawn request to /ipc/spawn/ for the IPC bridge
+// to relay to the controller, which creates a child AgentRun with the
+// requested skill. The parent agent polls for the sub-agent result.
+func spawnSubagentTool(args map[string]any) string {
+	skill, _ := args["skill"].(string)
+	task, _ := args["task"].(string)
+
+	if skill == "" {
+		return "Error: 'skill' is required — the domain to delegate to (e.g. 'observability', 'security', 'platform')"
+	}
+	if task == "" {
+		return "Error: 'task' is required — a self-contained task description for the sub-agent"
+	}
+
+	id := fmt.Sprintf("%d", time.Now().UnixNano())
+	req := struct {
+		Task    string   `json:"task"`
+		AgentID string   `json:"agentId"`
+		Skills  []string `json:"skills,omitempty"`
+	}{
+		Task:    task,
+		AgentID: skill,
+		Skills:  []string{fmt.Sprintf("openshift-%s", skill)},
+	}
+
+	data, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Sprintf("Error marshalling spawn request: %v", err)
+	}
+
+	dir := "/ipc/spawn"
+	_ = os.MkdirAll(dir, 0o755)
+	path := filepath.Join(dir, fmt.Sprintf("request-%s.json", id))
+
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return fmt.Sprintf("Error writing spawn request: %v", err)
+	}
+
+	log.Printf("Wrote spawn request: skill=%s id=%s", skill, id)
+
+	// Poll for the sub-agent result. The controller writes a response file
+	// once the child AgentRun completes.
+	resPath := filepath.Join(dir, fmt.Sprintf("result-%s.json", id))
+	deadline := time.Now().Add(5 * time.Minute)
+	for time.Now().Before(deadline) {
+		resData, err := os.ReadFile(resPath)
+		if err == nil && len(resData) > 0 {
+			var result struct {
+				Status   string `json:"status"`
+				Response string `json:"response"`
+				Error    string `json:"error"`
+			}
+			if json.Unmarshal(resData, &result) == nil {
+				_ = os.Remove(path)
+				_ = os.Remove(resPath)
+				if result.Status == "error" {
+					return fmt.Sprintf("Sub-agent '%s' failed: %s", skill, result.Error)
+				}
+				return result.Response
+			}
+		}
+		time.Sleep(2 * time.Second)
+	}
+
+	return fmt.Sprintf("Sub-agent '%s' timed out after 5 minutes. The task may still be running in the cluster.", skill)
 }

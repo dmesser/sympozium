@@ -100,21 +100,48 @@ func (p *Proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Extract task from messages: last user message is the task,
-	// system messages become the system prompt.
+	// Extract task from messages: system messages become the system prompt,
+	// the last user message is the current task, and any prior user/assistant
+	// turns are serialized as conversation context so the LLM sees history.
 	var systemParts []string
+	var history []ChatMessage
 	var task string
 	for _, msg := range req.Messages {
 		switch msg.Role {
 		case "system":
 			systemParts = append(systemParts, msg.Content)
-		case "user":
-			task = msg.Content
+		case "user", "assistant":
+			if msg.Role == "user" && task != "" {
+				history = append(history, ChatMessage{Role: "user", Content: task})
+			}
+			if msg.Role == "assistant" {
+				history = append(history, msg)
+			}
+			if msg.Role == "user" {
+				task = msg.Content
+			}
 		}
 	}
 	if task == "" {
 		writeError(w, http.StatusBadRequest, "no user message found")
 		return
+	}
+
+	if len(history) > 0 {
+		var sb strings.Builder
+		sb.WriteString("## Conversation History\n\n")
+		for _, h := range history {
+			if h.Role == "user" {
+				sb.WriteString("**User:** ")
+			} else {
+				sb.WriteString("**Assistant:** ")
+			}
+			sb.WriteString(h.Content)
+			sb.WriteString("\n\n")
+		}
+		sb.WriteString("## Current Request\n\n")
+		sb.WriteString(task)
+		task = sb.String()
 	}
 
 	ctx := r.Context()
@@ -234,26 +261,78 @@ func (p *Proxy) streamResponse(w http.ResponseWriter, r *http.Request, runName s
 			if event.Metadata["agentRunID"] != runName {
 				continue
 			}
-			var chunk struct {
-				Content string `json:"content"`
+		var chunk struct {
+			Type        string            `json:"type"`
+			Content     string            `json:"content"`
+			ToolID      string            `json:"toolId"`
+			ToolName    string            `json:"toolName"`
+			ToolArgs    string            `json:"toolArgs"`
+			Status      string            `json:"status"`
+			Suggestions json.RawMessage   `json:"suggestions"`
+		}
+		if err := json.Unmarshal(event.Data, &chunk); err != nil {
+			continue
+		}
+
+		switch chunk.Type {
+		case "tool_call":
+			var parsedArgs any
+			if err := json.Unmarshal([]byte(chunk.ToolArgs), &parsedArgs); err != nil {
+				parsedArgs = chunk.ToolArgs
 			}
-			if err := json.Unmarshal(event.Data, &chunk); err != nil {
-				continue
-			}
-			resp := ChatCompletionResponse{
-				ID:      "chatcmpl-" + runName,
-				Object:  "chat.completion.chunk",
-				Created: time.Now().Unix(),
-				Choices: []ChatCompletionChoice{
-					{
-						Index: 0,
-						Delta: &ChatMessage{Role: "assistant", Content: chunk.Content},
-					},
+			evt := map[string]any{
+				"event": "tool_call",
+				"data": map[string]any{
+					"id":   chunk.ToolID,
+					"name": chunk.ToolName,
+					"args": parsedArgs,
 				},
 			}
-			data, _ := json.Marshal(resp)
+			data, _ := json.Marshal(evt)
 			fmt.Fprintf(w, "data: %s\n\n", data)
 			flusher.Flush()
+		case "tool_result":
+			evt := map[string]any{
+				"event": "tool_result",
+				"data": map[string]any{
+					"id":      chunk.ToolID,
+					"status":  chunk.Status,
+					"content": chunk.Content,
+				},
+			}
+			data, _ := json.Marshal(evt)
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			flusher.Flush()
+		case "actions":
+			var suggestions any
+			if err := json.Unmarshal(chunk.Suggestions, &suggestions); err != nil {
+				suggestions = chunk.Suggestions
+			}
+			evt := map[string]any{
+				"event": "actions",
+				"data": map[string]any{
+					"suggestions": suggestions,
+				},
+			}
+			data, _ := json.Marshal(evt)
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			flusher.Flush()
+			default:
+				resp := ChatCompletionResponse{
+					ID:      "chatcmpl-" + runName,
+					Object:  "chat.completion.chunk",
+					Created: time.Now().Unix(),
+					Choices: []ChatCompletionChoice{
+						{
+							Index: 0,
+							Delta: &ChatMessage{Role: "assistant", Content: chunk.Content},
+						},
+					},
+				}
+				data, _ := json.Marshal(resp)
+				fmt.Fprintf(w, "data: %s\n\n", data)
+				flusher.Flush()
+			}
 
 		case event := <-completedCh:
 			if event.Metadata["agentRunID"] != runName {

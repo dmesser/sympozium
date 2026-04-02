@@ -4,6 +4,7 @@ package orchestrator
 
 import (
 	"fmt"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -62,6 +63,10 @@ type AgentPodConfig struct {
 	SandboxImage   string
 	SpawnDepth     int
 	Skills         []SkillMount
+
+	// AskTools lists tool names that require human approval before execution.
+	// Passed to the agent-runner as TOOL_POLICY_ASK (comma-separated).
+	AskTools []string
 
 	// OTel fields — set by the controller when observability is enabled.
 	Traceparent  string // W3C traceparent value to inject as TRACEPARENT env var
@@ -178,6 +183,12 @@ func buildAgentEnv(config AgentPodConfig) []corev1.EnvVar {
 			corev1.EnvVar{Name: "OTEL_EXPORTER_OTLP_ENDPOINT", Value: config.OTelEndpoint},
 			corev1.EnvVar{Name: "OTEL_SERVICE_NAME", Value: "sympozium-agent-runner"},
 		)
+	}
+	if len(config.AskTools) > 0 {
+		env = append(env, corev1.EnvVar{
+			Name:  "TOOL_POLICY_ASK",
+			Value: strings.Join(config.AskTools, ","),
+		})
 	}
 	return env
 }

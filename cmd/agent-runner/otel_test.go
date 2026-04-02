@@ -31,16 +31,8 @@ func TestOTelSpanHierarchy(t *testing.T) {
 	t.Run("simple_end_turn", func(t *testing.T) {
 		exporter.Reset()
 
-		// Mock Anthropic server returning a simple end_turn response.
 		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]any{
-				"id": "msg_test", "type": "message", "role": "assistant",
-				"model":       "claude-sonnet-4-20250514",
-				"content":     []map[string]string{{"type": "text", "text": "Hello!"}},
-				"stop_reason": "end_turn",
-				"usage":       map[string]int{"input_tokens": 10, "output_tokens": 5},
-			})
+			writeAnthropicSSEText(w, "msg_test", "claude-sonnet-4-20250514", "Hello!", "end_turn", 10, 5)
 		})
 		srv := httptest.NewServer(handler)
 		defer srv.Close()
@@ -109,29 +101,16 @@ func TestOTelSpanHierarchy(t *testing.T) {
 		callCount := 0
 		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			callCount++
-			w.Header().Set("Content-Type", "application/json")
 
 			if callCount == 1 {
-				json.NewEncoder(w).Encode(map[string]any{
-					"id": "msg_tool", "type": "message", "role": "assistant",
-					"model": "claude-sonnet-4-20250514",
-					"content": []map[string]any{
-						{"type": "tool_use", "id": "toolu_01X", "name": "read_file",
-							"input": map[string]string{"path": "/tmp/otel-test.txt"}},
-					},
-					"stop_reason": "tool_use",
-					"usage":       map[string]int{"input_tokens": 10, "output_tokens": 15},
-				})
+				inputJSON, _ := json.Marshal(map[string]string{"path": "/tmp/otel-test.txt"})
+				writeAnthropicSSEToolUse(w, "msg_tool", "claude-sonnet-4-20250514", "",
+					[]map[string]string{{"id": "toolu_01X", "name": "read_file", "input": string(inputJSON)}},
+					10, 15)
 				return
 			}
 
-			json.NewEncoder(w).Encode(map[string]any{
-				"id": "msg_final", "type": "message", "role": "assistant",
-				"model":       "claude-sonnet-4-20250514",
-				"content":     []map[string]any{{"type": "text", "text": "Done."}},
-				"stop_reason": "end_turn",
-				"usage":       map[string]int{"input_tokens": 20, "output_tokens": 5},
-			})
+			writeAnthropicSSEText(w, "msg_final", "claude-sonnet-4-20250514", "Done.", "end_turn", 20, 5)
 		})
 		srv := httptest.NewServer(handler)
 		defer srv.Close()

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,6 +15,168 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
 )
+
+// sseWrite writes a single SSE data line and flushes.
+func sseWrite(w http.ResponseWriter, data string) {
+	fmt.Fprintf(w, "data: %s\n\n", data)
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// sseWriteEvent writes an SSE event with type and data.
+func sseWriteEvent(w http.ResponseWriter, eventType, data string) {
+	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventType, data)
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// writeOpenAISSE writes an OpenAI-compatible streaming response for a simple
+// text completion.
+func writeOpenAISSE(w http.ResponseWriter, id, model, content, finishReason string, promptTok, completionTok int) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+
+	chunk1, _ := json.Marshal(map[string]any{
+		"id": id, "object": "chat.completion.chunk", "model": model,
+		"choices": []map[string]any{{
+			"index": 0, "delta": map[string]string{"role": "assistant"}, "finish_reason": nil,
+		}},
+	})
+	sseWrite(w, string(chunk1))
+
+	chunk2, _ := json.Marshal(map[string]any{
+		"id": id, "object": "chat.completion.chunk", "model": model,
+		"choices": []map[string]any{{
+			"index": 0, "delta": map[string]string{"content": content}, "finish_reason": nil,
+		}},
+	})
+	sseWrite(w, string(chunk2))
+
+	chunk3, _ := json.Marshal(map[string]any{
+		"id": id, "object": "chat.completion.chunk", "model": model,
+		"choices": []map[string]any{{
+			"index": 0, "delta": map[string]any{}, "finish_reason": finishReason,
+		}},
+		"usage": map[string]int{
+			"prompt_tokens": promptTok, "completion_tokens": completionTok,
+			"total_tokens": promptTok + completionTok,
+		},
+	})
+	sseWrite(w, string(chunk3))
+	sseWrite(w, "[DONE]")
+}
+
+// writeAnthropicSSEText writes an Anthropic-compatible streaming response for a
+// simple text message.
+func writeAnthropicSSEText(w http.ResponseWriter, id, model, text, stopReason string, inputTok, outputTok int) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(http.StatusOK)
+
+	msgStart, _ := json.Marshal(map[string]any{
+		"type": "message_start",
+		"message": map[string]any{
+			"id": id, "type": "message", "role": "assistant", "model": model,
+			"content": []any{}, "stop_reason": nil,
+			"usage": map[string]int{"input_tokens": inputTok, "output_tokens": 0},
+		},
+	})
+	sseWriteEvent(w, "message_start", string(msgStart))
+
+	cbStart, _ := json.Marshal(map[string]any{
+		"type": "content_block_start", "index": 0,
+		"content_block": map[string]string{"type": "text", "text": ""},
+	})
+	sseWriteEvent(w, "content_block_start", string(cbStart))
+
+	cbDelta, _ := json.Marshal(map[string]any{
+		"type": "content_block_delta", "index": 0,
+		"delta": map[string]string{"type": "text_delta", "text": text},
+	})
+	sseWriteEvent(w, "content_block_delta", string(cbDelta))
+
+	cbStop, _ := json.Marshal(map[string]any{"type": "content_block_stop", "index": 0})
+	sseWriteEvent(w, "content_block_stop", string(cbStop))
+
+	msgDelta, _ := json.Marshal(map[string]any{
+		"type":  "message_delta",
+		"delta": map[string]string{"stop_reason": stopReason},
+		"usage": map[string]int{"output_tokens": outputTok},
+	})
+	sseWriteEvent(w, "message_delta", string(msgDelta))
+
+	msgStop, _ := json.Marshal(map[string]any{"type": "message_stop"})
+	sseWriteEvent(w, "message_stop", string(msgStop))
+}
+
+// writeAnthropicSSEToolUse writes an Anthropic streaming response that contains
+// an optional text block followed by one or more tool_use blocks.
+func writeAnthropicSSEToolUse(w http.ResponseWriter, id, model string, textContent string, toolBlocks []map[string]string, inputTok, outputTok int) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(http.StatusOK)
+
+	msgStart, _ := json.Marshal(map[string]any{
+		"type": "message_start",
+		"message": map[string]any{
+			"id": id, "type": "message", "role": "assistant", "model": model,
+			"content": []any{}, "stop_reason": nil,
+			"usage": map[string]int{"input_tokens": inputTok, "output_tokens": 0},
+		},
+	})
+	sseWriteEvent(w, "message_start", string(msgStart))
+
+	blockIdx := 0
+
+	if textContent != "" {
+		cbStart, _ := json.Marshal(map[string]any{
+			"type": "content_block_start", "index": blockIdx,
+			"content_block": map[string]string{"type": "text", "text": ""},
+		})
+		sseWriteEvent(w, "content_block_start", string(cbStart))
+
+		cbDelta, _ := json.Marshal(map[string]any{
+			"type": "content_block_delta", "index": blockIdx,
+			"delta": map[string]string{"type": "text_delta", "text": textContent},
+		})
+		sseWriteEvent(w, "content_block_delta", string(cbDelta))
+
+		cbStop, _ := json.Marshal(map[string]any{"type": "content_block_stop", "index": blockIdx})
+		sseWriteEvent(w, "content_block_stop", string(cbStop))
+		blockIdx++
+	}
+
+	for _, tb := range toolBlocks {
+		cbStart, _ := json.Marshal(map[string]any{
+			"type": "content_block_start", "index": blockIdx,
+			"content_block": map[string]any{
+				"type": "tool_use", "id": tb["id"], "name": tb["name"], "input": map[string]any{},
+			},
+		})
+		sseWriteEvent(w, "content_block_start", string(cbStart))
+
+		cbDelta, _ := json.Marshal(map[string]any{
+			"type": "content_block_delta", "index": blockIdx,
+			"delta": map[string]string{"type": "input_json_delta", "partial_json": tb["input"]},
+		})
+		sseWriteEvent(w, "content_block_delta", string(cbDelta))
+
+		cbStop, _ := json.Marshal(map[string]any{"type": "content_block_stop", "index": blockIdx})
+		sseWriteEvent(w, "content_block_stop", string(cbStop))
+		blockIdx++
+	}
+
+	msgDelta, _ := json.Marshal(map[string]any{
+		"type":  "message_delta",
+		"delta": map[string]string{"stop_reason": "tool_use"},
+		"usage": map[string]int{"output_tokens": outputTok},
+	})
+	sseWriteEvent(w, "message_delta", string(msgDelta))
+
+	msgStop, _ := json.Marshal(map[string]any{"type": "message_stop"})
+	sseWriteEvent(w, "message_stop", string(msgStop))
+}
 
 func TestGetEnv(t *testing.T) {
 	tests := []struct {
@@ -189,29 +352,7 @@ func TestCallOpenAI_MockServer(t *testing.T) {
 		if r.Header.Get("Authorization") != "Bearer test-key" {
 			t.Errorf("unexpected auth header: %s", r.Header.Get("Authorization"))
 		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
-			"id":      "chatcmpl-test",
-			"object":  "chat.completion",
-			"created": 1234567890,
-			"model":   "gpt-4o-mini",
-			"choices": []map[string]any{
-				{
-					"index": 0,
-					"message": map[string]string{
-						"role":    "assistant",
-						"content": "Hello from mock!",
-					},
-					"finish_reason": "stop",
-				},
-			},
-			"usage": map[string]int{
-				"prompt_tokens":     5,
-				"completion_tokens": 10,
-				"total_tokens":      15,
-			},
-		})
+		writeOpenAISSE(w, "chatcmpl-test", "gpt-4o-mini", "Hello from mock!", "stop", 5, 10)
 	})
 
 	srv := httptest.NewServer(handler)
@@ -269,25 +410,7 @@ func TestCallAnthropic_MockServer(t *testing.T) {
 		if r.Header.Get("X-Api-Key") != "test-anthropic-key" {
 			t.Errorf("unexpected x-api-key header: %s", r.Header.Get("X-Api-Key"))
 		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
-			"id":    "msg_test",
-			"type":  "message",
-			"role":  "assistant",
-			"model": "claude-sonnet-4-20250514",
-			"content": []map[string]string{
-				{
-					"type": "text",
-					"text": "Hello from Anthropic mock!",
-				},
-			},
-			"stop_reason": "end_turn",
-			"usage": map[string]int{
-				"input_tokens":  8,
-				"output_tokens": 12,
-			},
-		})
+		writeAnthropicSSEText(w, "msg_test", "claude-sonnet-4-20250514", "Hello from Anthropic mock!", "end_turn", 8, 12)
 	})
 
 	srv := httptest.NewServer(handler)
@@ -352,28 +475,13 @@ func TestProviderRouting(t *testing.T) {
 
 	openaiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		openAICalled = true
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
-			"id": "test", "object": "chat.completion", "model": "m",
-			"choices": []map[string]any{{
-				"index":         0,
-				"message":       map[string]string{"role": "assistant", "content": "ok"},
-				"finish_reason": "stop",
-			}},
-			"usage": map[string]int{"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
-		})
+		writeOpenAISSE(w, "test", "m", "ok", "stop", 1, 1)
 	}))
 	defer openaiSrv.Close()
 
 	anthropicSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		anthropicCalled = true
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
-			"id": "msg_test", "type": "message", "role": "assistant", "model": "m",
-			"content":     []map[string]string{{"type": "text", "text": "ok"}},
-			"stop_reason": "end_turn",
-			"usage":       map[string]int{"input_tokens": 1, "output_tokens": 1},
-		})
+		writeAnthropicSSEText(w, "msg_test", "m", "ok", "end_turn", 1, 1)
 	}))
 	defer anthropicSrv.Close()
 
@@ -413,39 +521,20 @@ func TestProviderRouting(t *testing.T) {
 }
 
 func TestCallAnthropic_ToolUseFlow(t *testing.T) {
-	// Simulate the Anthropic tool-calling loop:
-	//   1. First response: model returns tool_use block → agent executes tool → sends tool_result
-	//   2. Second response: model returns final text
 	callCount := 0
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		callCount++
-		w.Header().Set("Content-Type", "application/json")
 
 		if callCount == 1 {
-			// First call: model wants to use a tool.
-			json.NewEncoder(w).Encode(map[string]any{
-				"id": "msg_tool", "type": "message", "role": "assistant", "model": "claude-sonnet-4-20250514",
-				"content": []map[string]any{
-					{
-						"type": "text",
-						"text": "I'll read that file for you.",
-					},
-					{
-						"type":  "tool_use",
-						"id":    "toolu_01ABC",
-						"name":  "read_file",
-						"input": map[string]string{"path": "/tmp/testfile.txt"},
-					},
-				},
-				"stop_reason": "tool_use",
-				"usage":       map[string]int{"input_tokens": 20, "output_tokens": 30},
-			})
+			inputJSON, _ := json.Marshal(map[string]string{"path": "/tmp/testfile.txt"})
+			writeAnthropicSSEToolUse(w, "msg_tool", "claude-sonnet-4-20250514",
+				"I'll read that file for you.",
+				[]map[string]string{{"id": "toolu_01ABC", "name": "read_file", "input": string(inputJSON)}},
+				20, 30)
 			return
 		}
 
-		// Second call: model produces final text after receiving tool result.
-		// Verify the request body includes the tool_result.
 		var body map[string]any
 		json.NewDecoder(r.Body).Decode(&body)
 		messages, _ := body["messages"].([]any)
@@ -453,14 +542,7 @@ func TestCallAnthropic_ToolUseFlow(t *testing.T) {
 			t.Errorf("expected at least 3 messages (user + assistant + tool_result), got %d", len(messages))
 		}
 
-		json.NewEncoder(w).Encode(map[string]any{
-			"id": "msg_final", "type": "message", "role": "assistant", "model": "claude-sonnet-4-20250514",
-			"content": []map[string]any{
-				{"type": "text", "text": "The file contains: hello world"},
-			},
-			"stop_reason": "end_turn",
-			"usage":       map[string]int{"input_tokens": 50, "output_tokens": 15},
-		})
+		writeAnthropicSSEText(w, "msg_final", "claude-sonnet-4-20250514", "The file contains: hello world", "end_turn", 50, 15)
 	})
 
 	srv := httptest.NewServer(handler)
@@ -508,30 +590,22 @@ func TestCallAnthropic_ToolUseFlow(t *testing.T) {
 }
 
 func TestCallAnthropic_MultipleToolCalls(t *testing.T) {
-	// Verify handling of multiple tool_use blocks in a single response.
 	callCount := 0
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		callCount++
-		w.Header().Set("Content-Type", "application/json")
 
 		if callCount == 1 {
-			// Model returns two tool_use blocks at once.
-			json.NewEncoder(w).Encode(map[string]any{
-				"id": "msg_multi", "type": "message", "role": "assistant", "model": "claude-sonnet-4-20250514",
-				"content": []map[string]any{
-					{"type": "tool_use", "id": "toolu_01A", "name": "read_file",
-						"input": map[string]string{"path": "/workspace/a.txt"}},
-					{"type": "tool_use", "id": "toolu_01B", "name": "read_file",
-						"input": map[string]string{"path": "/workspace/b.txt"}},
-				},
-				"stop_reason": "tool_use",
-				"usage":       map[string]int{"input_tokens": 10, "output_tokens": 20},
-			})
+			inputA, _ := json.Marshal(map[string]string{"path": "/workspace/a.txt"})
+			inputB, _ := json.Marshal(map[string]string{"path": "/workspace/b.txt"})
+			writeAnthropicSSEToolUse(w, "msg_multi", "claude-sonnet-4-20250514", "",
+				[]map[string]string{
+					{"id": "toolu_01A", "name": "read_file", "input": string(inputA)},
+					{"id": "toolu_01B", "name": "read_file", "input": string(inputB)},
+				}, 10, 20)
 			return
 		}
 
-		// Verify both tool_result blocks are present.
 		var body map[string]any
 		json.NewDecoder(r.Body).Decode(&body)
 		messages, _ := body["messages"].([]any)
@@ -548,12 +622,7 @@ func TestCallAnthropic_MultipleToolCalls(t *testing.T) {
 			t.Errorf("expected 2 tool_result blocks, got %d", resultCount)
 		}
 
-		json.NewEncoder(w).Encode(map[string]any{
-			"id": "msg_done", "type": "message", "role": "assistant", "model": "claude-sonnet-4-20250514",
-			"content":     []map[string]any{{"type": "text", "text": "Both files read."}},
-			"stop_reason": "end_turn",
-			"usage":       map[string]int{"input_tokens": 30, "output_tokens": 5},
-		})
+		writeAnthropicSSEText(w, "msg_done", "claude-sonnet-4-20250514", "Both files read.", "end_turn", 30, 5)
 	})
 
 	srv := httptest.NewServer(handler)
@@ -586,35 +655,22 @@ func TestCallAnthropic_MultipleToolCalls(t *testing.T) {
 }
 
 func TestCallAnthropic_ToolErrorIsError(t *testing.T) {
-	// Verify that tool results starting with "Error:" set is_error=true in
-	// the tool_result block sent back to Anthropic.
 	callCount := 0
 	var capturedBody map[string]any
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		callCount++
-		w.Header().Set("Content-Type", "application/json")
 
 		if callCount == 1 {
-			json.NewEncoder(w).Encode(map[string]any{
-				"id": "msg_err", "type": "message", "role": "assistant", "model": "claude-sonnet-4-20250514",
-				"content": []map[string]any{
-					{"type": "tool_use", "id": "toolu_err", "name": "read_file",
-						"input": map[string]string{"path": "/nonexistent/file.txt"}},
-				},
-				"stop_reason": "tool_use",
-				"usage":       map[string]int{"input_tokens": 5, "output_tokens": 10},
-			})
+			inputJSON, _ := json.Marshal(map[string]string{"path": "/nonexistent/file.txt"})
+			writeAnthropicSSEToolUse(w, "msg_err", "claude-sonnet-4-20250514", "",
+				[]map[string]string{{"id": "toolu_err", "name": "read_file", "input": string(inputJSON)}},
+				5, 10)
 			return
 		}
 
 		json.NewDecoder(r.Body).Decode(&capturedBody)
-		json.NewEncoder(w).Encode(map[string]any{
-			"id": "msg_recovery", "type": "message", "role": "assistant", "model": "claude-sonnet-4-20250514",
-			"content":     []map[string]any{{"type": "text", "text": "The file was not found."}},
-			"stop_reason": "end_turn",
-			"usage":       map[string]int{"input_tokens": 15, "output_tokens": 8},
-		})
+		writeAnthropicSSEText(w, "msg_recovery", "claude-sonnet-4-20250514", "The file was not found.", "end_turn", 15, 8)
 	})
 
 	srv := httptest.NewServer(handler)

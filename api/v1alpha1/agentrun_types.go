@@ -201,6 +201,11 @@ type ToolPolicySpec struct {
 
 	// Deny lists explicitly denied tools.
 	Deny []string `json:"deny,omitempty"`
+
+	// Ask lists tools that require human approval before execution.
+	// The agent-runner pauses and waits for approval via IPC before
+	// running any tool in this list.
+	Ask []string `json:"ask,omitempty"`
 }
 
 // AgentRunPhase represents the lifecycle phase of an AgentRun.

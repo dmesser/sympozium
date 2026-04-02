@@ -87,6 +87,9 @@ func (b *Bridge) Start(ctx context.Context) error {
 	// Watch for tool exec requests
 	go b.watchToolRequests(ctx)
 
+	// Watch for tool approval requests
+	go b.watchApprovalRequests(ctx)
+
 	// Watch for outbound messages
 	go b.watchMessages(ctx)
 
@@ -269,6 +272,55 @@ func (b *Bridge) handleExecRequest(ctx context.Context, fe FileEvent) {
 	}
 }
 
+// watchApprovalRequests watches /ipc/tools/ for approval-request-*.json files.
+func (b *Bridge) watchApprovalRequests(ctx context.Context) {
+	toolsPath := filepath.Join(b.BasePath, DirTools)
+	events, err := b.Watcher.Watch(ctx, toolsPath)
+	if err != nil {
+		b.Log.Error(err, "failed to watch tools directory for approval requests")
+		return
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case fe := <-events:
+			filename := filepath.Base(fe.Path)
+			if len(filename) > 17 && filename[:17] == "approval-request-" {
+				b.handleApprovalRequest(ctx, fe)
+			}
+		}
+	}
+}
+
+// handleApprovalRequest processes an approval request from the agent-runner.
+func (b *Bridge) handleApprovalRequest(ctx context.Context, fe FileEvent) {
+	if _, loaded := b.processedFiles.LoadOrStore(fe.Path, true); loaded {
+		return
+	}
+
+	data, err := os.ReadFile(fe.Path)
+	if err != nil {
+		b.Log.Error(err, "failed to read approval request", "path", fe.Path)
+		b.processedFiles.Delete(fe.Path)
+		return
+	}
+
+	metadata := map[string]string{
+		"agentRunID":   b.AgentRunID,
+		"instanceName": b.InstanceName,
+	}
+
+	event, _ := eventbus.NewEvent(eventbus.TopicToolApprovalRequest, metadata, json.RawMessage(data))
+	if err := b.EventBus.Publish(ctx, eventbus.TopicToolApprovalRequest, event); err != nil {
+		b.Log.Error(err, "failed to publish approval request")
+	}
+
+	b.Log.Info("Forwarded tool approval request to control plane",
+		"agentRunID", b.AgentRunID)
+}
+
 // watchMessages watches /ipc/messages/ for outbound channel messages.
 func (b *Bridge) watchMessages(ctx context.Context) {
 	messagesPath := filepath.Join(b.BasePath, DirMessages)
@@ -376,13 +428,24 @@ func (b *Bridge) subscribeToInbound(ctx context.Context) {
 		return
 	}
 
+	// Subscribe to spawn results for this agent (when it spawned sub-agents).
+	spawnResultCh, err := b.EventBus.Subscribe(ctx, fmt.Sprintf("agent.spawn.result.%s", b.AgentRunID))
+	if err != nil {
+		b.Log.Error(err, "failed to subscribe to spawn result events")
+	}
+
+	// Subscribe to tool approval responses for this agent.
+	approvalResponseCh, err := b.EventBus.Subscribe(ctx, fmt.Sprintf("tool.approval.response.%s", b.AgentRunID))
+	if err != nil {
+		b.Log.Error(err, "failed to subscribe to tool approval response events")
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
 
 		case event := <-followupCh:
-			// Write follow-up message to /ipc/input/
 			filename := fmt.Sprintf("followup-%d.json", time.Now().UnixNano())
 			path := filepath.Join(b.BasePath, DirInput, filename)
 			if err := os.WriteFile(path, event.Data, 0640); err != nil {
@@ -390,12 +453,33 @@ func (b *Bridge) subscribeToInbound(ctx context.Context) {
 			}
 
 		case event := <-execResultCh:
-			// Write exec result to /ipc/tools/
 			filename := fmt.Sprintf("exec-result-%d.json", time.Now().UnixNano())
 			path := filepath.Join(b.BasePath, DirTools, filename)
 			if err := os.WriteFile(path, event.Data, 0640); err != nil {
 				b.Log.Error(err, "failed to write exec result")
 			}
+
+		case event := <-spawnResultCh:
+			if event == nil {
+				continue
+			}
+			filename := fmt.Sprintf("result-%d.json", time.Now().UnixNano())
+			path := filepath.Join(b.BasePath, DirSpawn, filename)
+			if err := os.WriteFile(path, event.Data, 0640); err != nil {
+				b.Log.Error(err, "failed to write spawn result")
+			}
+			b.Log.Info("Wrote spawn result for parent agent")
+
+		case event := <-approvalResponseCh:
+			if event == nil {
+				continue
+			}
+			filename := fmt.Sprintf("approval-response-%d.json", time.Now().UnixNano())
+			path := filepath.Join(b.BasePath, DirTools, filename)
+			if err := os.WriteFile(path, event.Data, 0640); err != nil {
+				b.Log.Error(err, "failed to write approval response")
+			}
+			b.Log.Info("Wrote tool approval response for agent")
 		}
 	}
 }

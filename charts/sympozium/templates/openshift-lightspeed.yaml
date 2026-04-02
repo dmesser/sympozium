@@ -1,0 +1,91 @@
+{{- if .Values.openshiftLightspeed.enabled }}
+---
+# SympoziumPolicy: OpenShift Lightspeed — human-in-the-loop for state-changing tools.
+apiVersion: sympozium.ai/v1alpha1
+kind: SympoziumPolicy
+metadata:
+  name: openshift-lightspeed
+  labels:
+    sympozium.ai/builtin: "true"
+    {{- include "sympozium.labels" . | nindent 4 }}
+spec:
+  sandboxPolicy:
+    required: false
+    maxCPU: "4"
+    maxMemory: 8Gi
+    allowHostMounts: false
+  toolGating:
+    defaultAction: allow
+    rules:
+      # Read-only tools are always allowed
+      - tool: read_file
+        action: allow
+      - tool: list_directory
+        action: allow
+      - tool: fetch_url
+        action: allow
+      # Sub-agent spawning is allowed (the router uses this)
+      - tool: spawn_subagent
+        action: allow
+      # State-changing tools require human approval
+      - tool: execute_command
+        action: ask
+      - tool: write_file
+        action: ask
+  subagentPolicy:
+    maxDepth: 3
+    maxConcurrent: 5
+  networkPolicy:
+    denyAll: false
+    allowDNS: true
+    allowEventBus: true
+  featureGates:
+    code-execution: true
+    sub-agents: true
+    file-access: true
+---
+# SympoziumInstance: OpenShift Lightspeed multi-agent deployment.
+apiVersion: sympozium.ai/v1alpha1
+kind: SympoziumInstance
+metadata:
+  name: openshift-lightspeed
+  labels:
+    sympozium.ai/builtin: "true"
+    {{- include "sympozium.labels" . | nindent 4 }}
+spec:
+  agents:
+    default:
+      model: {{ .Values.openshiftLightspeed.model | default "gpt-4o" | quote }}
+      {{- if .Values.openshiftLightspeed.baseURL }}
+      baseURL: {{ .Values.openshiftLightspeed.baseURL | quote }}
+      {{- end }}
+      subagents:
+        maxDepth: 3
+        maxConcurrent: 5
+        maxChildrenPerAgent: 4
+  authRefs:
+    - secret: {{ .Values.openshiftLightspeed.authSecret | default "openshift-lightspeed-llm-key" | quote }}
+      provider: {{ .Values.openshiftLightspeed.provider | default "openai" | quote }}
+  policyRef: openshift-lightspeed
+  skills:
+    - skillPackRef: openshift-router
+    - skillPackRef: openshift-observability
+    - skillPackRef: openshift-security
+    - skillPackRef: openshift-platform
+    - skillPackRef: openshift-software-catalog
+    - skillPackRef: web-endpoint
+  {{- if .Values.openshiftLightspeed.mcpServers }}
+  mcpServers:
+    {{- toYaml .Values.openshiftLightspeed.mcpServers | nindent 4 }}
+  {{- end }}
+  webEndpoint:
+    enabled: true
+    {{- if .Values.openshiftLightspeed.webEndpoint }}
+    {{- if .Values.openshiftLightspeed.webEndpoint.hostname }}
+    hostname: {{ .Values.openshiftLightspeed.webEndpoint.hostname | quote }}
+    {{- end }}
+    {{- end }}
+  memory:
+    enabled: true
+    maxSizeKB: 256
+{{- end }}
