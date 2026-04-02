@@ -1,12 +1,11 @@
 {{- if .Values.defaultSkills.enabled }}
 {{- range $path, $_ := .Files.Glob "files/skills/*.yaml" }}
-{{- if not (hasSuffix "web-endpoint.yaml" $path) }}
 ---
 {{- $content := $.Files.Get $path }}
 {{- $content = $content | replace "namespace: sympozium-system" (printf "namespace: %s" (include "sympozium.namespace" $)) }}
 {{- $content = $content | replace "ghcr.io/sympozium-ai/sympozium/" (printf "%s/" $.Values.image.registry) }}
 {{- $content = $content | replace ":latest" (printf ":%s" $.Values.image.tag) }}
+{{- $content = trimPrefix "---" ($content | trimAll "\n ") }}
 {{ $content }}
-{{- end }}
 {{- end }}
 {{- end }}
